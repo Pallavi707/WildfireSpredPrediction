@@ -53,6 +53,47 @@ Wildfire-Spread-Prediction/
 
 ## Getting Started
 
+### Data Preparation
+
+### Data Preparation
+
+> **Note:** The dataset is not included in this repository due to size limitations.
+
+This project uses the [Next Day Wildfire Spread dataset](https://www.kaggle.com/datasets/fantineh/next-day-wildfire-spread) available on Kaggle. Please follow the steps below to download and prepare the data:
+
+#### 1. Download the Dataset
+- Visit the dataset page:  
+  https://www.kaggle.com/datasets/fantineh/next-day-wildfire-spread
+- Download the `archive.zip` file and **extract it into your project directory**.
+
+After extraction, your folder should contain:
+
+archive/
+│── next_day_wildfire_spread_train.tfrecord
+│── next_day_wildfire_spread_test.tfrecord
+│── next_day_wildfire_spread_eval.tfrecord
+
+#### 2. Convert TFRecord Files to Pickle
+
+Run the provided script to convert the `.tfrecord` files into `.pkl` format used for training:
+
+```bash
+python convert_tfrecord_to_pickle.py
+
+This will generate the following files in the data/next-day-wildfire-spread/ folder:
+
+data/
+└── next-day-wildfire-spread/
+    ├── train.data
+    ├── train.labels
+    ├── test.data
+    ├── test.labels
+    ├── validation.data
+    └── validation.labels
+
+These .pkl files are used by training, evaluation, and simulation scripts.
+
+
 ### Installation
 
 ```bash

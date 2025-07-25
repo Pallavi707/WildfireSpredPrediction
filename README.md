@@ -55,8 +55,6 @@ Wildfire-Spread-Prediction/
 
 ### Data Preparation
 
-### Data Preparation
-
 > **Note:** The dataset is not included in this repository due to size limitations.
 
 This project uses the [Next Day Wildfire Spread dataset](https://www.kaggle.com/datasets/fantineh/next-day-wildfire-spread) available on Kaggle. Please follow the steps below to download and prepare the data:
@@ -101,16 +99,16 @@ git clone https://github.com/<your-username>/Wildfire-Spread-Prediction.git
 cd Wildfire-Spread-Prediction
 pip install -r requirements.txt
 ```
+### Model Evaluation
 
-### Data Preparation
+#### 3. To run the model on validation data and check the results
 
-- Place your landscape/environmental data in `data/raw/`.
-- Run preprocessing (if needed):
-  ```bash
-  python src/data_preprocessing.py
-  ```
+Run trainModel.py
 
----
+This trainModel.py script is used for training the model and saving the best model weights to the folder savedModels.
+
+To evaluate the final performance run the fina_evaluation.py file.
+
 
 ## Usage
 

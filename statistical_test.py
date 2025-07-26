@@ -1,51 +1,54 @@
 import json
 import scipy.stats as stats
-import matplotlib.pyplot as plt
+import itertools
 
 # ------------------ Load JSON File ------------------
-with open("savedModels/per_image_metrics.json", "r") as f:
+with open("savedModels/test_results.json", "r") as f:
     metrics = json.load(f)
 
-# ------------------ Choose Models and Metric ------------------
-model_a = "U_Net-FOCAL+DICE"
-model_b = "U_Net-WBCE+DICE"
-metric_name = ["dice", "f1", "iou"]
+# ------------------ Configuration ------------------
+alpha = 0.05
+model_names = list(metrics.keys())
+metric_names = list(metrics[model_names[0]]["per_image_metrics"].keys())
+#metric_names = ['accuracy']
 
-def get_scores(model_a,model_b, metric):
-        # ------------------ Extract per-image metric lists ------------------
-        print(f'------------------- Extracting per-image metrics for {metric.upper()} ------------------')
-        # Extract per-image metric lists
+# ------------------ Column Names ------------------
+headers = ["Model A", "Model B", "Metric", "t-stat", "p-value", "Significant"]
+
+# ------------------ Build Table Data ------------------
+table_data = []
+
+for model_a, model_b in itertools.combinations(model_names, 2):
+    for metric in metric_names:
         scores_a = metrics[model_a]["per_image_metrics"][metric]
         scores_b = metrics[model_b]["per_image_metrics"][metric]
 
-        # ------------------ Sanity Checks ------------------
-        assert len(scores_a) == len(scores_b), "Both models must have the same number of samples"
-        print(f"Comparing {metric.upper()} scores for {len(scores_a)} images.")
+        try:
+            t_stat, p_val = stats.ttest_rel(scores_a, scores_b)
+            sig = "Yes" if p_val < alpha else "No"
+            t_stat = f"{t_stat:.4f}"
+            p_val = f"{p_val:.2e}"
+        except Exception:
+            t_stat, p_val, sig = "NA", "NA", "NA"
 
+        table_data.append([model_a, model_b, metric, t_stat, p_val, sig])
 
-        # ------------------ Hypothesis Testing ------------------
+# ------------------ Dynamic Column Widths ------------------
+col_widths = [max(len(str(row[i])) for row in ([headers] + table_data)) for i in range(len(headers))]
 
-        # Null Hypothesis (H0): No difference between the models' scores
-        # Alternative Hypothesis (H1): One model has statistically significantly different performance
+# ------------------ Print Table ------------------
+def print_row(row):
+    print("| " + " | ".join(str(cell).ljust(col_widths[i]) for i, cell in enumerate(row)) + " |")
 
-        # 1. Paired t-test (parametric)
-        t_stat, p_val_ttest = stats.ttest_rel(scores_a, scores_b)
-        print(f"\nPaired t-test:")
-        print(f"t-statistic = {t_stat:.4f}, p-value (exact) = {p_val_ttest:.10e}")
+def print_divider():
+    print("+-" + "-+-".join("-" * w for w in col_widths) + "-+")
 
-        # 2. Wilcoxon Signed-Rank Test (non-parametric)
-        w_stat, p_val_wilcoxon = stats.wilcoxon(scores_a, scores_b)
-        print(f"\nWilcoxon signed-rank test:")
-        print(f"w-statistic = {w_stat:.4f}, p-value (exact) = {p_val_wilcoxon:.10e}")
+# Print Header
+print_divider()
+print_row(headers)
+print_divider()
 
-
-        # ------------------ Interpretation ------------------
-        alpha = 0.05
-        if p_val_wilcoxon < alpha:
-            print(f"\nResult: Statistically significant difference in {metric.upper()} scores (p < {alpha})")
-        else:
-            print(f"\nResult: No statistically significant difference in {metric.upper()} scores (p ≥ {alpha})")
-
-for metric in metric_name:
-    print(f"\n--- {metric.upper()} Comparison ---")
-    get_scores(model_a, model_b, metric)
+# Print Rows
+for row in table_data:
+    print_row(row)
+    print_divider()

@@ -14,9 +14,8 @@ import numpy as np
 from torch.utils.data import Dataset, IterableDataset, DataLoader
 from milesial_unet_model import UNet1, APAU_Net
 from leejunhyun_unet_models import U_Net, R2U_Net, AttU_Net, R2AttU_Net, AttU_Net_S
-from CellularAutomataPostprocessing import UNet1_CA
+from CellularAutomataPostprocessing import UNetWithPostCA, NeuralCA
 from CellularAutomataAllfeaturespostporcessing import UNetWithPostCA19
-from transformerCA import TransformerCA_Seg
 import pickle
 import random
 import os
@@ -298,7 +297,7 @@ def find_best_threshold(
     dataloader,
     loss_name,
     thresholds=np.linspace(0.01, 0.99, 99),
-    lambda_fn=10.0  # cost(FN)/cost(FP)
+    lambda_fn=20.0  # cost(FN)/cost(FP)
 ):
     """
     Cost-sensitive thresholding for imbalanced wildfire masks.
@@ -481,10 +480,7 @@ def train(gpu, args, loss_name):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-    #model = UNetWithPostCA19(19, 1).cuda()
-    #model = UNet1_CA(19, 1).cuda()
-    model = TransformerCA_Seg(in_ch=19, img_size=64, out_ch=1, patch_size=4).cuda()
-    
+    model = UNetWithPostCA19(19, 1).cuda()
     optimizer = torch.optim.RMSprop(model.parameters(), lr=0.004, momentum=0.9)
 
     start = datetime.now()
@@ -505,7 +501,6 @@ def train(gpu, args, loss_name):
             images = images.cuda(non_blocking=True)
             labels = labels.cuda(non_blocking=True)
 
-        
             outputs = model(images)
             loss_value = loss(labels, outputs, loss_name) 
             loss_train += to_py_float(loss_value)

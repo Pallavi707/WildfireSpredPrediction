@@ -15,15 +15,22 @@ from torch.utils.data import Dataset, IterableDataset, DataLoader
 from milesial_unet_model import UNet1, APAU_Net
 from leejunhyun_unet_models import U_Net, R2U_Net, AttU_Net, R2AttU_Net, AttU_Net_S
 from CellularAutomataPostprocessing import UNet1_CA
-from CellularAutomataAllfeaturespostporcessing import UNetWithPostCA19
-from transformerCA import TransformerCA_Seg
+from CellularAutomataAllfeaturespostporcessing import U2Net_CA
+# from transformerCA import TransformerCA_Seg
 import pickle
 import random
 import os
 import json
 
+# ---------- NEW: plotting imports (no seaborn) ----------
+import matplotlib
+matplotlib.use("Agg")  # headless save
+import matplotlib.pyplot as plt
+from matplotlib.patches import Patch  # legend handles
+
 # --------- Defaults (no CLI needed) ----------
 MC_PASSES = int(os.environ.get("MC_DROPOUT_PASSES", "30"))
+LAMBDA_FN = 1
 
 # ---------- helpers to avoid NumPy scalars in checkpoints + safe loading ----------
 def to_py_float(x):
@@ -65,10 +72,7 @@ def safe_load_checkpoint(path, map_location="cpu"):
 # -------------------- Bayesian (MC) utilities — default, no CLI needed -------------------- #
 @torch.no_grad()
 def _enable_mc_dropout(model: torch.nn.Module):
-    """
-    Enable dropout at inference time by setting only Dropout layers to train(),
-    leaving the rest of the model in eval() mode.
-    """
+    """Enable dropout at inference time by setting only Dropout layers to train()."""
     for m in model.modules():
         if isinstance(m, (nn.Dropout, nn.Dropout2d, nn.Dropout3d, nn.AlphaDropout)):
             m.train()
@@ -83,8 +87,8 @@ def _model_has_dropout(model: torch.nn.Module) -> bool:
 def mc_dropout_collect_mean_var(model, dataloader, n_passes=MC_PASSES):
     """
     Run MC passes with stochasticity:
-      - If the model has Dropout, we enable it at inference (MC Dropout).
-      - Otherwise, we add small Gaussian noise to the *inputs* each pass (keeps training unchanged).
+      - If the model has Dropout, enable it (MC Dropout).
+      - Otherwise, add small Gaussian noise to inputs each pass.
 
     Returns:
       mean_probs: Tensor [N, 1, H, W]
@@ -99,7 +103,7 @@ def mc_dropout_collect_mean_var(model, dataloader, n_passes=MC_PASSES):
         input_noise_sigma = 0.0  # pure MC Dropout
         print("[Bayesian Eval] Using MC Dropout (dropout layers found).")
     else:
-        input_noise_sigma = 0.03  # default tiny input noise (for models without dropout)
+        input_noise_sigma = 0.03  # tiny input noise (for models without dropout)
         print(f"[Bayesian Eval] No dropout found; using input Gaussian noise sigma={input_noise_sigma}.")
 
     pass_sums = None
@@ -138,62 +142,62 @@ def mc_dropout_collect_mean_var(model, dataloader, n_passes=MC_PASSES):
     var_probs = pass_sq_sums / float(n_passes) - mean_probs.pow(2)
     return mean_probs, var_probs, all_labels_list
 
-def find_best_threshold_from_probs(mean_probs, all_labels, thresholds=np.linspace(0.01, 0.99, 99), lambda_fn=20.0):
+# >>> PAPER RULE (Bayesian): choose t maximizing the *median* Dice across images
+@torch.no_grad()
+def find_best_threshold_from_probs_max_median_dice(mean_probs, all_labels, thresholds=np.linspace(0.001, 0.99, 120)):
     """
-    Same risk minimisation as find_best_threshold, but works on precomputed probability maps.
+    Choose threshold that maximizes the median Dice across images (paper's rule).
+    Operates on precomputed probability maps.
     """
-    def conf_counts(y, p):
-        yb = y.view(-1)
-        pb = p.view(-1)
-        tp = torch.sum((pb == 1) & (yb == 1)).item()
-        fp = torch.sum((pb == 1) & (yb == 0)).item()
-        fn = torch.sum((pb == 0) & (yb == 1)).item()
-        tn = torch.sum((pb == 0) & (yb == 0)).item()
-        return tp, fp, fn, tn
+    N = all_labels.size(0)
+    best_t, best_med = 0.5, -1.0
+    for t in thresholds:
+        bins = (mean_probs > t).float()
+        dices = []
+        for i in range(N):
+            dices.append(to_py_float(dice_score(all_labels[i], bins[i])))
+        med = float(np.median(dices)) if len(dices) else 0.0
+        if med > best_med:
+            best_med = med
+            best_t = float(t)
+    return best_t, best_med
 
+def find_best_threshold_from_probs(mean_probs, all_labels, thresholds=np.linspace(0.001, 0.99, 120), lambda_fn=LAMBDA_FN):
+    """
+    Global risk minimisation on precomputed probability maps.
+    """
+    y = all_labels.view(-1)
     best = {"thresh": 0.5, "risk": float("inf"), "dice": -1.0, "prec": 0.0, "rec": 0.0}
     with torch.no_grad():
         for t in thresholds:
-            preds = (mean_probs > t).float()
-            risks, dice_vals, prec_vals, rec_vals = [], [], [], []
-            for i in range(all_labels.size(0)):
-                y = all_labels[i]
-                p = preds[i]
-                tp, fp, fn, tn = conf_counts(y, p)
-                pos = tp + fn
-                neg = fp + tn
-                fn_rate = 0.0 if pos == 0 else (fn / pos)
-                fp_rate = 0.0 if neg == 0 else (fp / neg)
-                prec = 0.0 if (tp + fp) == 0 else (tp / (tp + fp))
-                rec  = 0.0 if (tp + fn) == 0 else (tp / (tp + fn))
-                denom = (2*tp + fp + fn)
-                dice = 0.0 if denom == 0 else (2*tp / denom)
-                risks.append(lambda_fn * fn_rate + fp_rate)
-                dice_vals.append(dice)
-                prec_vals.append(prec)
-                rec_vals.append(rec)
+            p = (mean_probs > t).float().view(-1)
 
-            avg_risk = float(np.mean(risks)) if risks else float("inf")
-            avg_dice = float(np.mean(dice_vals)) if dice_vals else 0.0
-            avg_prec = float(np.mean(prec_vals)) if prec_vals else 0.0
-            avg_rec  = float(np.mean(rec_vals)) if rec_vals else 0.0
+            tp = torch.sum((p == 1) & (y == 1)).item()
+            fp = torch.sum((p == 1) & (y == 0)).item()
+            fn = torch.sum((p == 0) & (y == 1)).item()
+            tn = torch.sum((p == 0) & (y == 0)).item()
 
-            if avg_risk < best["risk"]:
-                best = {
-                    "thresh": float(t),
-                    "risk":  avg_risk,
-                    "dice":  avg_dice,
-                    "prec":  avg_prec,
-                    "rec":   avg_rec
-                }
+            pos = tp + fn
+            neg = fp + tn
+            fn_rate = 0.0 if pos == 0 else (fn / pos)
+            fp_rate = 0.0 if neg == 0 else (fp / neg)
+
+            prec = 0.0 if (tp + fp) == 0 else (tp / (tp + fp))
+            rec  = 0.0 if (tp + fn) == 0 else (tp / (tp + fn))
+            denom = (2*tp + fp + fn)
+            dice = 0.0 if denom == 0 else (2*tp / denom)
+            risk = lambda_fn * fn_rate + fp_rate
+
+            if risk < best["risk"]:
+                best = {"thresh": float(t), "risk": float(risk), "dice": float(dice),
+                        "prec": float(prec), "rec": float(rec)}
     return best["thresh"], best["dice"]
 
 def compute_metrics_from_probs(mean_probs, all_labels, threshold=0.5):
     """
-    Compute the same aggregate metrics as perform_validation(),
-    but from precomputed probability maps instead of running the model.
-    Returns tuple: (avg_loss, avg_iou, avg_accuracy, avg_f1, avg_auc, avg_dice, avg_precision, avg_recall)
-    Note: 'loss' here is set to 0.0 because we don't recompute criterion on binarised outputs.
+    Compute aggregate metrics from precomputed probability maps.
+    Returns: (avg_loss, avg_iou, avg_accuracy, avg_f1, avg_auc, avg_dice, avg_precision, avg_recall)
+    Note: 'loss' here is set to 0.0 (no criterion on probs here).
     """
     preds = (mean_probs > threshold).float()
     total_iou = 0.0
@@ -207,13 +211,15 @@ def compute_metrics_from_probs(mean_probs, all_labels, threshold=0.5):
     with torch.no_grad():
         for i in range(all_labels.size(0)):
             y = all_labels[i]
-            p = preds[i]
-            total_iou += to_py_float(mean_iou(y, p))
-            total_accuracy += to_py_float(accuracy(y, p))
-            total_f1 += to_py_float(f1_score(y, p))
-            total_auc += to_py_float(auc_score(y, p))
-            total_dice += to_py_float(dice_score(y, p))
-            pr, rc = precision_recall(y, p)
+            p_bin = preds[i]
+            p_prob = mean_probs[i]
+
+            total_iou += to_py_float(mean_iou(y, p_bin))
+            total_accuracy += to_py_float(accuracy(y, p_bin))
+            total_f1 += to_py_float(f1_score(y, p_bin))
+            total_auc += to_py_float(auc_score(y, p_prob))
+            total_dice += to_py_float(dice_score(y, p_bin))
+            pr, rc = precision_recall(y, p_bin)
             total_precision += to_py_float(pr)
             total_recall += to_py_float(rc)
 
@@ -231,6 +237,157 @@ def compute_metrics_from_probs(mean_probs, all_labels, threshold=0.5):
     )
 # ------------------------------------------------------------------------ #
 
+# =================== NEW: plotting helpers (non-invasive) =================== #
+PREV_FIRE_IDX = 7  # in your feature order
+
+@torch.no_grad()
+def _collect_fire_samples(model, loader, threshold=0.5, max_cols=10):
+    """Grab up to max_cols samples (Prev, GT, Pred) from the first few batches."""
+    model.eval()
+    prev_list, gt_list, pred_list = [], [], []
+    for images, labels in loader:
+        images = images.cuda(non_blocking=True)
+        labels = labels.cuda(non_blocking=True)
+        logits = model(images)
+        probs = torch.sigmoid(logits)
+        preds = (probs > threshold).float()
+
+        prev = images[:, PREV_FIRE_IDX]  # [B,H,W]
+        prev = (prev > 0.5).float()
+
+        for i in range(images.size(0)):
+            prev_list.append(prev[i].detach().cpu().numpy())
+            gt_list.append(labels[i, 0].detach().cpu().numpy())
+            pred_list.append(preds[i, 0].detach().cpu().numpy())
+            if len(prev_list) >= max_cols:
+                return prev_list, gt_list, pred_list
+    return prev_list, gt_list, pred_list
+
+def _comparison_rgb(gt, pred):
+    """RGB overlay: TP→green, FP→red, FN→blue; TN/background→black."""
+    gt = (gt > 0.5).astype(np.uint8)
+    pred = (pred > 0.5).astype(np.uint8)
+    tp = (gt == 1) & (pred == 1)
+    fp = (gt == 0) & (pred == 1)
+    fn = (gt == 1) & (pred == 0)
+
+    H, W = gt.shape
+    rgb = np.zeros((H, W, 3), dtype=np.float32)
+    rgb[..., 1] = tp.astype(np.float32)  # green
+    rgb[..., 0] = fp.astype(np.float32)  # red
+    rgb[..., 2] = fn.astype(np.float32)  # blue
+    return rgb
+
+def save_fire_grid(prev_list, gt_list, pred_list, save_path, title=None):
+    """Save a 4xN grid: Prev | GT | Pred | Comparison (rows) with a bottom legend."""
+    assert len(prev_list) == len(gt_list) == len(pred_list)
+    N = len(prev_list)
+    if N == 0:
+        print(f"[Plot] No samples to plot at {save_path}")
+        return
+
+    fig = plt.figure(figsize=(1.8 * N, 7.6))
+    if title:
+        fig.suptitle(title, y=0.98, fontsize=12)
+
+    rows = 4
+    last_comp_ax = None
+    for c in range(N):
+        ax = plt.subplot(rows, N, c + 1)
+        ax.imshow(prev_list[c], cmap="gray", interpolation="nearest")
+        if c == 0: ax.set_ylabel("Previous\nfire mask", fontsize=10)
+        ax.set_xticks([]); ax.set_yticks([])
+
+        ax = plt.subplot(rows, N, N + c + 1)
+        ax.imshow(gt_list[c], cmap="gray", interpolation="nearest")
+        if c == 0: ax.set_ylabel("True\nfire mask", fontsize=10)
+        ax.set_xticks([]); ax.set_yticks([])
+
+        ax = plt.subplot(rows, N, 2*N + c + 1)
+        ax.imshow(pred_list[c], cmap="gray", interpolation="nearest")
+        if c == 0: ax.set_ylabel("Predicted\nfire mask", fontsize=10)
+        ax.set_xticks([]); ax.set_yticks([])
+
+        comp = _comparison_rgb(gt_list[c], pred_list[c])
+        ax = plt.subplot(rows, N, 3*N + c + 1)
+        ax.imshow(comp, interpolation="nearest")
+        if c == 0: ax.set_ylabel("Prediction\ncomparison", fontsize=10)
+        ax.set_xticks([]); ax.set_yticks([])
+        last_comp_ax = ax  # save for legend
+
+    # Existing in-plot legend (kept, but you can delete this block if you don't want it)
+    if last_comp_ax is not None:
+        legend_elements = [
+            Patch(facecolor='green', edgecolor='green', label='TP (green)'),
+            Patch(facecolor='red', edgecolor='red', label='FP (red)'),
+            Patch(facecolor='blue', edgecolor='blue', label='FN (blue)'),
+            Patch(facecolor='black', edgecolor='black', label='TN / background (black)'),
+        ]
+        last_comp_ax.legend(handles=legend_elements, loc='lower right', fontsize=8, framealpha=0.6)
+
+    # NEW: bottom, centered legend strip like the paper figure
+    bottom_legend = [
+        Patch(facecolor='green', edgecolor='green', label='True Positive'),
+        Patch(facecolor='red', edgecolor='red', label='False Positive'),
+        Patch(facecolor='blue', edgecolor='blue', label='False Negative'),
+        Patch(facecolor='black', edgecolor='black', label='No Fire'),
+    ]
+    # Give a little extra bottom space for the legend bar
+    plt.tight_layout(rect=(0, 0.06, 1, 0.96))
+    fig.legend(
+        handles=bottom_legend,
+        loc='lower center',
+        ncol=4,
+        frameon=True,
+        fontsize=9,
+        bbox_to_anchor=(0.5, 0.01)
+    )
+
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    plt.savefig(save_path, dpi=200)
+    plt.close(fig)
+    print(f"[Plot] Saved fire grid → {save_path}")
+
+
+def save_training_curves(train_loss_hist, val_metrics_hist, save_dir):
+    """
+    Save PNGs:
+      - loss_curves.png: train loss vs epoch, val loss vs epoch
+      - f1_dice_curves.png: validation F1 and Dice vs epoch
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    epochs = np.arange(1, len(train_loss_hist) + 1)
+
+    if len(val_metrics_hist) > 0:
+        val_loss = np.array([m[0] for m in val_metrics_hist], dtype=float)
+        val_f1   = np.array([m[3] for m in val_metrics_hist], dtype=float)
+        val_dice = np.array([m[5] for m in val_metrics_hist], dtype=float)
+    else:
+        val_loss = np.zeros_like(epochs, dtype=float)
+        val_f1   = np.zeros_like(epochs, dtype=float)
+        val_dice = np.zeros_like(epochs, dtype=float)
+
+    fig1 = plt.figure(figsize=(7, 4.2))
+    plt.plot(epochs, train_loss_hist, label="Train loss")
+    plt.plot(epochs, val_loss, label="Val loss")
+    plt.xlabel("Epoch"); plt.ylabel("Loss"); plt.title("Training/Validation Loss")
+    plt.grid(True, alpha=0.3); plt.legend()
+    plt.tight_layout()
+    path1 = os.path.join(save_dir, "loss_curves.png")
+    plt.savefig(path1, dpi=200); plt.close(fig1)
+    print(f"[Plot] Saved {path1}")
+
+    fig2 = plt.figure(figsize=(7, 4.2))
+    plt.plot(epochs, val_f1, label="Val F1")
+    plt.plot(epochs, val_dice, label="Val Dice")
+    plt.xlabel("Epoch"); plt.ylabel("Score"); plt.title("Validation F1 & Dice")
+    plt.grid(True, alpha=0.3); plt.legend()
+    plt.tight_layout()
+    path2 = os.path.join(save_dir, "f1_dice_curves.png")
+    plt.savefig(path2, dpi=200); plt.close(fig2)
+    print(f"[Plot] Saved {path2}")
+# ============================================================================ #
+
 TRAIN = 'train'
 VAL = 'validation'
 MASTER_RANK = 0
@@ -239,8 +396,8 @@ SAVE_INTERVAL = 1
 DATASET_PATH = 'data/next-day-wildfire-spread'
 SAVE_MODEL_PATH = 'savedModels'
 
-loss_functions = ['WBCE+DICE', 'FOCAL', 'FOCAL+DICE']
-#loss_functions = ['FOCAL+DICE']
+# loss_functions = ['WBCE+DICE', 'FOCAL', 'FOCAL+DICE']
+loss_functions = ['FOCAL+DICE']
 
 def main():
     parser = argparse.ArgumentParser()
@@ -250,7 +407,6 @@ def main():
     parser.add_argument('-g', '--gpus', default=1, type=int, help='number of gpus per node')
     parser.add_argument('-nr', '--nr', default=0, type=int, help='ranking within the nodes')
     parser.add_argument('--epochs', default=10, type=int, metavar='N', help='number of total epochs to run')
-    
     args = parser.parse_args()
     print(f'initializing training on single GPU')
 
@@ -276,7 +432,7 @@ def create_data_loaders(rank, gpu, world_size, selected_features=None):
         feature_indices = list(range(len(ALL_FEATURES)))
         selected_features = ALL_FEATURES
 
-    datasets = {
+    dataset_obj = {
         TRAIN: RotatedWildfireDataset(f"{DATASET_PATH}/{TRAIN}.data", 
                                       f"{DATASET_PATH}/{TRAIN}.labels", 
                                       features=feature_indices, crop_size=64),
@@ -286,23 +442,17 @@ def create_data_loaders(rank, gpu, world_size, selected_features=None):
     }
 
     dataLoaders = {
-        TRAIN: torch.utils.data.DataLoader(dataset=datasets[TRAIN], batch_size=batch_size, shuffle=True, num_workers=os.cpu_count() // 2, pin_memory=True),
-        VAL: torch.utils.data.DataLoader(dataset=datasets[VAL], batch_size=batch_size, shuffle=False, num_workers=os.cpu_count() // 2, pin_memory=True)
+        TRAIN: torch.utils.data.DataLoader(dataset=dataset_obj[TRAIN], batch_size=batch_size, shuffle=True, num_workers=os.cpu_count() // 2, pin_memory=True),
+        VAL: torch.utils.data.DataLoader(dataset=dataset_obj[VAL], batch_size=batch_size, shuffle=False, num_workers=os.cpu_count() // 2, pin_memory=True)
     }
 
     return dataLoaders
 
-# -------------------- Cost-sensitive threshold selection (deterministic) -------------------- #
-def find_best_threshold(
-    model,
-    dataloader,
-    loss_name,
-    thresholds=np.linspace(0.01, 0.99, 99),
-    lambda_fn=10.0  # cost(FN)/cost(FP)
-):
-    """
-    Cost-sensitive thresholding for imbalanced wildfire masks.
-    """
+# -------------------- Threshold selection (per-image vs global) -------------------- #
+def find_best_threshold_per_image(model, dataloader, loss_name,
+                                  thresholds=np.linspace(0.001, 0.99, 120),
+                                  lambda_fn=LAMBDA_FN):
+    """Your original per-image risk rule (averages risk across images)."""
     model.eval()
     with torch.no_grad():
         all_probs, all_labels = [], []
@@ -313,12 +463,10 @@ def find_best_threshold(
             probs = torch.sigmoid(logits)
             all_probs.append(probs)    # [B,1,H,W]
             all_labels.append(labels)  # [B,1,H,W]
-
         all_probs = torch.cat(all_probs, dim=0)
         all_labels = torch.cat(all_labels, dim=0)
 
     def conf_counts(y, p):
-        # y, p: [1,H,W] with {0,1}
         yb = y.view(-1)
         pb = p.view(-1)
         tp = torch.sum((pb == 1) & (yb == 1)).item()
@@ -328,29 +476,21 @@ def find_best_threshold(
         return tp, fp, fn, tn
 
     best = {"thresh": 0.5, "risk": float("inf"), "dice": -1.0, "prec": 0.0, "rec": 0.0}
-
     for t in thresholds:
         preds = (all_probs > t).float()
-
         risks, dice_vals, prec_vals, rec_vals = [], [], [], []
         for i in range(all_labels.size(0)):
             y = all_labels[i]
             p = preds[i]
-
             tp, fp, fn, tn = conf_counts(y, p)
 
             pos = tp + fn
             neg = fp + tn
-
-            # Safeguards for images with no positives/negatives
             fn_rate = 0.0 if pos == 0 else (fn / pos)
             fp_rate = 0.0 if neg == 0 else (fp / neg)
 
-            # Precision/recall for logging
             prec = 0.0 if (tp + fp) == 0 else (tp / (tp + fp))
             rec  = 0.0 if (tp + fn) == 0 else (tp / (tp + fn))
-
-            # Dice for logging
             denom = (2*tp + fp + fn)
             dice = 0.0 if denom == 0 else (2*tp / denom)
 
@@ -365,28 +505,105 @@ def find_best_threshold(
         avg_rec  = float(np.mean(rec_vals)) if rec_vals else 0.0
 
         if avg_risk < best["risk"]:
-            best = {
-                "thresh": float(t),
-                "risk": avg_risk,
-                "dice": avg_dice,
-                "prec": avg_prec,
-                "rec":  avg_rec
-            }
-
-    print(f"\n[Threshold Selection] Cost-sensitive (lambda={lambda_fn:.1f}) "
-          f"→ t={best['thresh']:.2f}, risk={best['risk']:.6f}, "
-          f"prec={best['prec']:.4f}, rec={best['rec']:.4f}, dice={best['dice']:.4f}")
+            best = {"thresh": float(t), "risk": avg_risk, "dice": avg_dice,
+                    "prec": avg_prec, "rec": avg_rec}
+    print(f"[Threshold Selection / per-image] λ={lambda_fn} → t={best['thresh']:.3f}, "
+          f"risk={best['risk']:.6f}, prec={best['prec']:.4f}, rec={best['rec']:.4f}, dice={best['dice']:.4f}")
     return best["thresh"], best["dice"]
+
+def find_best_threshold_global(model, dataloader, loss_name,
+                               thresholds=np.linspace(0.001, 0.99, 120),
+                               lambda_fn=LAMBDA_FN):
+    """NEW: Global risk rule—aggregate TP/FP/FN/TN over the whole set for each t."""
+    model.eval()
+    with torch.no_grad():
+        all_probs, all_labels = [], []
+        for images, labels in dataloader:
+            images = images.cuda(non_blocking=True)
+            labels = labels.cuda(non_blocking=True)
+            logits = model(images)
+            probs = torch.sigmoid(logits)
+            all_probs.append(probs)    # [B,1,H,W]
+            all_labels.append(labels)  # [B,1,H,W]
+        probs = torch.cat(all_probs, dim=0).view(-1)
+        labels = torch.cat(all_labels, dim=0).view(-1)
+
+    best = {"thresh": 0.5, "risk": float("inf"), "dice": -1.0, "prec": 0.0, "rec": 0.0}
+    for t in thresholds:
+        p = (probs > t).float()
+
+        tp = torch.sum((p == 1) & (labels == 1)).item()
+        fp = torch.sum((p == 1) & (labels == 0)).item()
+        fn = torch.sum((p == 0) & (labels == 1)).item()
+        tn = torch.sum((p == 0) & (labels == 0)).item()
+
+        pos = tp + fn
+        neg = fp + tn
+        fn_rate = 0.0 if pos == 0 else (fn / pos)
+        fp_rate = 0.0 if neg == 0 else (fp / neg)
+
+        prec = 0.0 if (tp + fp) == 0 else (tp / (tp + fp))
+        rec  = 0.0 if (tp + fn) == 0 else (tp / (tp + fn))
+        denom = (2*tp + fp + fn)
+        dice = 0.0 if denom == 0 else (2*tp / denom)
+        risk = lambda_fn * fn_rate + fp_rate
+
+        if risk < best["risk"]:
+            best = {"thresh": float(t), "risk": float(risk), "dice": float(dice),
+                    "prec": float(prec), "rec": float(rec)}
+    print(f"[Threshold Selection / GLOBAL] λ={lambda_fn} → t={best['thresh']:.3f}, "
+          f"risk={best['risk']:.6f}, prec={best['prec']:.4f}, rec={best['rec']:.4f}, dice={best['dice']:.4f}")
+    return best["thresh"], best["dice"]
+
+# >>> PAPER RULE: maximize *median* Dice on the TRAIN set
+def find_best_threshold_max_median_dice_on_loader(model, dataloader, thresholds=np.linspace(0.001, 0.99, 120)):
+    """
+    Paper's segmentation threshold rule:
+      Choose t that maximizes the *median* Dice across images of the given loader (TRAIN).
+    """
+    model.eval()
+    with torch.no_grad():
+        best_t, best_med = 0.5, -1.0
+        for t in thresholds:
+            per_img_dice = []
+            for images, labels in dataloader:
+                images = images.cuda(non_blocking=True)
+                labels = labels.cuda(non_blocking=True)
+                logits = model(images)
+                probs = torch.sigmoid(logits)
+                preds = (probs > t).float()
+                for i in range(images.size(0)):
+                    per_img_dice.append(to_py_float(dice_score(labels[i], preds[i])))
+            median_d = float(np.median(per_img_dice)) if len(per_img_dice) else 0.0
+            if median_d > best_med:
+                best_med = median_d
+                best_t = float(t)
+    print(f"[Threshold Selection / PAPER (max median Dice on TRAIN)] t={best_t:.3f}, median Dice={best_med:.4f}")
+    return best_t, best_med
+
+def find_best_threshold(model, dataloader, loss_name, mode="global",
+                        thresholds=np.linspace(0.001, 0.99, 120), lambda_fn=LAMBDA_FN):
+    if mode == "per_image":
+        return find_best_threshold_per_image(model, dataloader, loss_name, thresholds, lambda_fn)
+    elif mode == "paper_max_median_dice":
+        return find_best_threshold_max_median_dice_on_loader(model, dataloader, thresholds)
+    else:
+        return find_best_threshold_global(model, dataloader, loss_name, thresholds, lambda_fn)
 # ------------------------------------------------------------------------------------- #
 
 def perform_validation(model, loader, loss_name, return_per_image_metrics=False, threshold=0.5):
+    """
+    VALIDATION FIXES:
+      - loss computed on logits (not thresholded masks)
+      - AUC computed on probabilities
+      - IoU/F1/Dice/Precision/Recall on thresholded predictions
+    """
     model.eval()
 
     per_image_dice = []
     per_image_iou = []
     per_image_f1 = []
 
-    # make all accumulators native floats
     total_loss = 0.0
     total_iou = 0.0
     total_accuracy = 0.0
@@ -400,24 +617,29 @@ def perform_validation(model, loader, loss_name, return_per_image_metrics=False,
         for i, (images, labels) in enumerate(loader):
             images = images.cuda(non_blocking=True)
             labels = labels.cuda(non_blocking=True)
-            outputs = model(images)
-            probs = torch.sigmoid(outputs)
-            outputs = (probs > threshold).float()
 
-            total_loss += to_py_float(loss(labels, outputs, loss_name))
-            total_iou += to_py_float(mean_iou(labels, outputs))
-            total_accuracy += to_py_float(accuracy(labels, outputs))
-            total_f1 += to_py_float(f1_score(labels, outputs))
-            total_auc += to_py_float(auc_score(labels, outputs))
-            total_dice += to_py_float(dice_score(labels, outputs))
+            logits = model(images)                     # raw logits
+            probs  = torch.sigmoid(logits)             # probabilities
+            bins   = (probs > threshold).float()       # hard mask for thresholded metrics
 
-            precision, recall = precision_recall(labels, outputs)
+            # ✅ loss on logits (your loss() handled logits in training)
+            total_loss += to_py_float(loss(labels, logits, loss_name))
+
+            # ✅ AUC on probabilities
+            total_auc += to_py_float(auc_score(labels, probs))
+
+            # Thresholded metrics
+            total_iou += to_py_float(mean_iou(labels, bins))
+            total_accuracy += to_py_float(accuracy(labels, bins))
+            total_f1 += to_py_float(f1_score(labels, bins))
+            total_dice += to_py_float(dice_score(labels, bins))
+            precision, recall = precision_recall(labels, bins)
             total_precision += to_py_float(precision)
             total_recall += to_py_float(recall)
 
             for j in range(images.size(0)):
                 label = labels[j]
-                pred = outputs[j]
+                pred = bins[j]
                 per_image_dice.append(to_py_float(dice_score(label, pred)))
                 per_image_iou.append(to_py_float(mean_iou(label, pred)))
                 per_image_f1.append(to_py_float(f1_score(label, pred)))
@@ -481,11 +703,14 @@ def train(gpu, args, loss_name):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-    #model = UNetWithPostCA19(19, 1).cuda()
-    #model = UNet1_CA(19, 1).cuda()
-    model = TransformerCA_Seg(in_ch=19, img_size=64, out_ch=1, patch_size=4).cuda()
+    model = U2Net_CA(19, 1).cuda()
+    # model = UNet1_CA(19, 1).cuda()
+    # model = U_Net(19, 1).cuda()
+    # model = TransformerCA_Seg(in_ch=19, img_size=64, out_ch=1, patch_size=4).cuda()
     
-    optimizer = torch.optim.RMSprop(model.parameters(), lr=0.004, momentum=0.9)
+    #optimizer = torch.optim.RMSprop(model.parameters(), lr=0.002, momentum=0.9)
+    #optimizer = torch.optim.Adam(model.parameters(), lr=1e-2, betas=(0.9, 0.999), eps=1e-8)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-5)
 
     start = datetime.now()
     print(f'TRAINING ON: {platform.node()}, Starting at: {datetime.now()}')
@@ -498,6 +723,7 @@ def train(gpu, args, loss_name):
     val_metrics_history = []
 
     for epoch in range(args.epochs):
+        dataLoaders[TRAIN].dataset.reseed_crops(seed=epoch)
         model.train()
         loss_train = 0.0
 
@@ -505,7 +731,6 @@ def train(gpu, args, loss_name):
             images = images.cuda(non_blocking=True)
             labels = labels.cuda(non_blocking=True)
 
-        
             outputs = model(images)
             loss_value = loss(labels, outputs, loss_name) 
             loss_train += to_py_float(loss_value)
@@ -551,6 +776,9 @@ def train(gpu, args, loss_name):
             else:
                 print("Model is not being saved")
 
+    # ---------- NEW: save curves after training ----------
+    save_training_curves(train_loss_history, val_metrics_history, SAVE_MODEL_PATH)
+
     pickle.dump([float(v) for v in train_loss_history], open(f"{SAVE_MODEL_PATH}/train_loss_history.pkl", "wb"))
     pickle.dump([tuple(float(x) for x in m) for m in val_metrics_history], open(f"{SAVE_MODEL_PATH}/val_metrics_history.pkl", "wb"))
 
@@ -561,14 +789,50 @@ def train(gpu, args, loss_name):
         print(f"Training completed in {int(elapsed_seconds // 3600)}h {int((elapsed_seconds % 3600) // 60)}m {int(elapsed_seconds % 60)}s")
         print(f"Best epoch: {best_epoch + 1}")
         print(f"Best F1 score: {best_f1_score}")
+        
+        # --- Print all metrics from the epoch where F1 was best (weights saved) ---
+        if 0 <= best_epoch < len(val_metrics_history):
+            (best_val_loss,
+            best_val_iou,
+            best_val_acc,
+            best_val_f1,
+            best_val_auc,
+            best_val_dice,
+            best_val_prec,
+            best_val_rec) = val_metrics_history[best_epoch]
+
+            print("\nValidation metrics at best-F1 epoch:")
+            print(f"  Epoch: {best_epoch + 1}")
+            print(f"  Loss: {best_val_loss:.4f}, IoU: {best_val_iou:.4f}, Accuracy: {best_val_acc:.4f}")
+            print(f"  F1: {best_val_f1:.4f}, AUC: {best_val_auc:.4f}, Dice: {best_val_dice:.4f}")
+            print(f"  Precision: {best_val_prec:.4f}, Recall: {best_val_rec:.4f}")
+
+            if 0 <= best_epoch < len(train_loss_history):
+                print(f"  Train loss (same epoch): {train_loss_history[best_epoch]:.4f}")
+        else:
+            print("\n[Warn] Could not retrieve metrics for best epoch.")
 
         model_path = f"{SAVE_MODEL_PATH}/model-{model.__class__.__name__}-{loss_name}-bestF1Score-Rank-{rank}.weights"
         state = torch.load(model_path, map_location="cpu")
         model.load_state_dict(state)
 
-        # ==================== Deterministic evaluation (unchanged) ====================
-        best_threshold, best_dice = find_best_threshold(model, dataLoaders[VAL], loss_name)
-        results = perform_validation(model, dataLoaders[VAL], loss_name, return_per_image_metrics=True, threshold=best_threshold)
+        # ==================== Deterministic evaluation (PAPER threshold rule) ====================
+        # Pick threshold on TRAIN by maximizing *median* Dice, then apply to VAL
+        paper_best_threshold, paper_med_dice = find_best_threshold(
+            model, dataLoaders[TRAIN], loss_name, mode="paper_max_median_dice",
+            thresholds=np.unique(np.r_[0.001, 0.003, 0.005, np.linspace(0.01, 0.99, 99)])
+        )
+        results = perform_validation(model, dataLoaders[VAL], loss_name, return_per_image_metrics=True, threshold=paper_best_threshold)
+        val_dice_at_t = float(results["avg_metrics"]["dice"])
+
+        # ---------- qualitative grid on validation set ----------
+        try:
+            prev_list, gt_list, pred_list = _collect_fire_samples(model, dataLoaders[VAL], threshold=paper_best_threshold, max_cols=12)
+            grid_title = f"{model.__class__.__name__} — {loss_name} — t={paper_best_threshold:.2f} (TRAIN median Dice)"
+            grid_path = os.path.join(SAVE_MODEL_PATH, "qualitative_fire_grid.png")
+            save_fire_grid(prev_list, gt_list, pred_list, grid_path, title=grid_title)
+        except Exception as e:
+            print(f"[Plot] Skipped qualitative grid due to error: {e}")
 
         # --- SAVE deterministic threshold + results ---
         ckpt_path = os.path.join(SAVE_MODEL_PATH, f"model-{model.__class__.__name__}-{loss_name}-bestF1Score-Rank-{rank}.pt")
@@ -577,14 +841,15 @@ def train(gpu, args, loss_name):
         else:
             ckpt = {}
 
-        ckpt["best_threshold"] = float(best_threshold)
+        ckpt["best_threshold"] = float(paper_best_threshold)
         ckpt["threshold_selection_rule"] = {
-            "type": "cost_sensitive",
-            "lambda_fn": 20.0,
-            "risk": "lambda*FN_rate + FP_rate",
-            "sweep": "linspace(0.01, 0.99, 99)"
+            "type": "paper_max_median_dice",
+            "picked_on": "TRAIN",
+            "sweep": "linspace incl {0.001,0.003,0.005} + 0.01..0.99",
+            "note": "Threshold maximizes the median Dice across TRAIN images; applied to VAL/TEST."
         }
-        ckpt["best_threshold_val_dice"] = float(best_dice)
+        ckpt["best_threshold_train_median_dice"] = float(paper_med_dice)
+        ckpt["best_threshold_val_dice"] = float(val_dice_at_t)  # keep for compatibility
         torch.save(ckpt, ckpt_path)
 
         os.makedirs(SAVE_MODEL_PATH, exist_ok=True)
@@ -592,8 +857,9 @@ def train(gpu, args, loss_name):
         entry = {
             "timestamp": datetime.now().isoformat(timespec="seconds"),
             "model_id": f"{model.__class__.__name__}-{loss_name}",
-            "best_threshold": float(best_threshold),
-            "val_dice_at_best_threshold": float(best_dice),
+            "best_threshold": float(paper_best_threshold),
+            "train_median_dice_at_best_threshold": float(paper_med_dice),
+            "val_dice_at_best_threshold": float(val_dice_at_t),
             "rule": ckpt["threshold_selection_rule"],
         }
         try:
@@ -619,32 +885,32 @@ def train(gpu, args, loss_name):
 
         # ==================== Bayesian evaluation (MC / input noise) ====================
         print(f"\n[Bayesian Eval] Running MC with n_passes={MC_PASSES} ...")
-        mean_probs, var_probs, all_labels = mc_dropout_collect_mean_var(model, dataLoaders[VAL], n_passes=MC_PASSES)
 
-        # pick threshold using Bayesian mean probs
-        bayes_best_t, bayes_best_dice = find_best_threshold_from_probs(
-            mean_probs, all_labels, thresholds=np.linspace(0.01, 0.99, 99), lambda_fn=20.0
+        # PAPER RULE for Bayesian: pick t on TRAIN probability maps by max median Dice, apply to VAL
+        mean_probs_train, var_probs_train, labels_train = mc_dropout_collect_mean_var(model, dataLoaders[TRAIN], n_passes=MC_PASSES)
+        bayes_paper_t, bayes_train_med_dice = find_best_threshold_from_probs_max_median_dice(
+            mean_probs_train, labels_train,
+            thresholds=np.unique(np.r_[0.001, 0.003, 0.005, np.linspace(0.01, 0.99, 99)])
         )
 
-        # compute metrics at that threshold
-        bayes_metrics_tuple = compute_metrics_from_probs(mean_probs, all_labels, threshold=bayes_best_t)
+        mean_probs_val, var_probs_val, labels_val = mc_dropout_collect_mean_var(model, dataLoaders[VAL], n_passes=MC_PASSES)
+        bayes_metrics_tuple = compute_metrics_from_probs(mean_probs_val, labels_val, threshold=bayes_paper_t)
         bayes_avg_loss, bayes_iou, bayes_acc, bayes_f1, bayes_auc, bayes_dice, bayes_prec, bayes_rec = bayes_metrics_tuple
 
-        # summarise uncertainty
-        avg_variance = float(var_probs.mean().item())
-        max_variance = float(var_probs.max().item())
+        avg_variance = float(var_probs_val.mean().item())
+        max_variance = float(var_probs_val.max().item())
 
         bayes_results = {
             "settings": {
                 "mc_passes": int(MC_PASSES),
                 "threshold_rule": {
-                    "type": "cost_sensitive",
-                    "lambda_fn": 20.0,
-                    "risk": "lambda*FN_rate + FP_rate",
-                    "sweep": "linspace(0.01, 0.99, 99)"
+                    "type": "paper_max_median_dice",
+                    "picked_on": "TRAIN",
+                    "sweep": "linspace incl {0.001,0.003,0.005} + 0.01..0.99",
                 }
             },
-            "best_threshold": float(bayes_best_t),
+            "best_threshold": float(bayes_paper_t),
+            "train_median_dice_at_t": float(bayes_train_med_dice),
             "val_metrics_at_t": {
                 "loss": float(bayes_avg_loss),
                 "iou": float(bayes_iou),
@@ -661,7 +927,6 @@ def train(gpu, args, loss_name):
             }
         }
 
-        # save into checkpoint under separate bayesian namespace
         if os.path.exists(ckpt_path):
             ckpt = safe_load_checkpoint(ckpt_path, map_location="cpu")
         else:
@@ -670,15 +935,14 @@ def train(gpu, args, loss_name):
         ckpt["bayesian_eval"][loss_name] = bayes_results
         torch.save(ckpt, ckpt_path)
 
-        # save a separate bayesian thresholds json
         bayes_thresh_file = os.path.join(SAVE_MODEL_PATH, "best_thresholds_bayesian.json")
         bayes_entry = {
             "timestamp": datetime.now().isoformat(timespec="seconds"),
             "model_id": f"{model.__class__.__name__}-{loss_name}",
             "mc_passes": int(MC_PASSES),
-            "best_threshold": float(bayes_best_t),
-            "val_dice_at_best_threshold": float(bayes_dice),
-            "uncertainty_mean_var": float(avg_variance)
+            "best_threshold": float(bayes_paper_t),
+            "train_median_dice_at_best_threshold": float(bayes_train_med_dice),
+            "val_dice_at_best_threshold": float(bayes_dice)
         }
         try:
             with open(bayes_thresh_file, "r") as f:
@@ -689,7 +953,6 @@ def train(gpu, args, loss_name):
         with open(bayes_thresh_file, "w") as f:
             json.dump(db_b, f, indent=4)
 
-        # per-image metrics file (Bayesian) — here we store only aggregate + uncertainty summary
         bayes_metrics_file = os.path.join(SAVE_MODEL_PATH, "bayesian_eval_summary.json")
         try:
             with open(bayes_metrics_file, "r") as f:

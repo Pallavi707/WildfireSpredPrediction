@@ -80,11 +80,11 @@ def loss(gold_mask, pred_mask, loss_name):
     if loss_name == "WBCE":
         return WBCE(gold_mask, pred_mask)
     elif loss_name == "FOCAL":
-        return focal_loss(gold_mask, pred_mask, alpha=0.25, gamma=2.0)
+        return focal_loss(gold_mask, pred_mask, alpha=0.50, gamma=2.0)
     elif loss_name == "WBCE+DICE":
         return WBCE(gold_mask, pred_mask) + 2 * soft_dice_loss(gold_mask, pred_mask)
     elif loss_name == "FOCAL+DICE":
-        return focal_loss(gold_mask, pred_mask, alpha=0.25, gamma=2.0) + 2 * soft_dice_loss(gold_mask, pred_mask)
+        return focal_loss(gold_mask, pred_mask, alpha=0.50, gamma=2.0) + 2 * soft_dice_loss(gold_mask, pred_mask)
     else:
         raise ValueError(f"Unsupported loss type: {loss_name}")
 

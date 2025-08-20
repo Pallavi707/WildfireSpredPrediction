@@ -11,8 +11,9 @@ import os
 
 """Constants for the data reader."""
 
-INPUT_FEATURES = ['elevation', 'th', 'vs',  'tmmn', 'tmmx', 'sph', 
-                  'pr', 'pdsi', 'NDVI', 'population', 'erc', 'PrevFireMask']
+INPUT_FEATURES = ['elevation', 'fws', 'population', 'pdsi', 'pr', 'sph', 'slope', 'PrevFireMask', 
+                  'erc', 'NDVI', 'fpr', 'ftemp', 'th', 'EVI', 'vs', 'tmmx', 'fwd', 
+                  'aspect', 'tmmn']
 
 OUTPUT_FEATURES = ['FireMask',]
 
@@ -22,59 +23,83 @@ OUTPUT_FEATURES = ['FireMask',]
 DATA_STATS = {
     # Elevation in m.
     # 0.1 percentile, 99.9 percentile
-    'elevation': (0.0, 3141.0, 657.3003, 649.0147),
+    'elevation': (0.0, 3492.0, 973.8651650565012, 848.2582623382642),
     
     # Drought Index (Palmer Drought Severity Index)
     # 0.1 percentile, 99.9 percentile
-    'pdsi': (-6.12974870967865, 7.876040384292651, -0.0052714925, 2.6823447),
+    'pdsi': (-6.929506301879883, 6.933391571044922, -0.5917681081888462, 2.631040721581213),
     
     #Vegetation index (times 10,000 maybe, since it's supposed to be b/w -1 and 1?)
-    'NDVI': (-9821.0, 9996.0, 5157.625, 2466.6677),  # min, max
+    'NDVI': (-1030.5584442138675, 8642.758791992237, 5164.3233936349225, 1702.2336274971083),  # min, max
    
     # Precipitation in mm.
     # Negative values do not make sense, so min is set to 0.
     # 0., 99.9 percentile
-    'pr': (0.0, 44.53038024902344, 1.7398051, 4.482833),
+    'pr': (-0.10937719792127609, 16.0850124359130864, 0.2079030104452133, 1.120996442992493),
    
     # Specific humidity.
     # Negative values do not make sense, so min is set to 0.
     # The range of specific humidity is up to 100% so max is 1.
-    'sph': (0., 1., 0.0071658953, 0.0042835088),
+    'sph': (0., 0.019455255940556526, 0.006173964228252022, 0.003562594725196875),
     
     # Wind direction in degrees clockwise from north.
     # Thus min set to 0 and max set to 360.
-    'th': (0., 360.0, 190.32976, 72.59854),
+    'th': (0., 349.893463134765, 203.51448736597345, 75.17527113547739),
     
     # Min/max temperature in Kelvin.
     
     #Min temp
     # -20 degree C, 99.9 percentile
-    'tmmn': (253.15, 298.94891357421875, 281.08768, 8.982386),
+    'tmmn': (0.0, 300.07110595703125, 281.0813526978816, 26.776763832658812),
     
     #Max temp
     # -20 degree C, 99.9 percentile
-    'tmmx': (253.15, 315.09228515625, 295.17383, 9.815496),
+    'tmmx': (0.0, 316.160400390625, 296.7791755110431, 28.21604481568473),
     
     # Wind speed in m/s.
     # Negative values do not make sense, given there is a wind direction.
     # 0., 99.9 percentile
-    'vs': (0.0, 10.024310074806237, 3.8500874, 1.4109988),
+    'vs': (0.0, 10.161438941955566, 3.670841557634326, 1.376505541638688),
     
     # NFDRS fire danger index energy release component expressed in BTU's per
     # square foot.
     # Negative values do not make sense. Thus min set to zero.
     # 0., 99.9 percentile
-    'erc': (0.0, 106.24891662597656, 37.326267, 20.846027),
+    'erc': (0.0, 110.70502471923828, 58.42723711884473, 26.448045709188296),
     
     # Population density
     # min, 99.9 percentile
-    'population': (0., 2534.06298828125, 25.531384, 154.72331),
+    'population': (0., 3464.451171875, 32.06895734368147, 214.94144945265535),
     
+    #FWS
+    'fws': (-7.611932770252228, 16.34676742553711, 0.8698552858092746, 2.808712593586319),
+    
+    #SLOPE
+    'slope': (0.0,26.122961044311523, 3.7763974131349465, 4.6385693305945805),
+    
+    #ERC
+    'erc': (0.0, 110.70502471923828, 58.42723711884473, 26.448045709188296),
+    
+    'fpr': (0.0005380672519095242, 0.01970484294369823, 0.006215652860019671, 0.003481157915072828),
+    
+    #FTEMP
+    'ftemp': (-1.0703978538513184, 40.34566116333008, 24.022050817701835, 6.891479893238092),
+
+    #EVI
+    'EVI': (0.0, 6330.7783208007895, 2782.431770790949, 935.4603390827173),
+    #FWD
+    'fwd': (-9.776235580444336, 13.015328407287598, 0.9124042024569722, 2.907059560489641),
+
+    #ASPECT
+    'aspect': (-0.0, 358.8988952636719, 170.92333794728714, 102.2358012656133),
+
+
     # We don't want to normalize the FireMasks.
     # 1 indicates fire, 0 no fire, -1 unlabeled data
     'PrevFireMask': (-1., 1., 0., 1.),
     'FireMask': (-1., 1., 0., 1.)
 }
+
 
 """Library of common functions used in deep learning neural networks.
 """
@@ -329,7 +354,7 @@ def get_dataset(file_pattern: Text, data_size: int, sample_size: int,
 
 def remove_bad_samples(dataset):
     # bad samples are any target fire masks with missing data
-    fire_masks_array = np.array(dataset[:, 12, :, :])
+    fire_masks_array = np.array(dataset[:, 19, :, :])
     good_indices = []
 
     for img_num in range(len(fire_masks_array)):
@@ -345,7 +370,7 @@ def main(dataset_path):
         file_pattern='archive/next_day_wildfire_spread_train*',
         data_size=64,
         sample_size=32,
-        num_in_channels=12,
+        num_in_channels=19,
         compression_type=None,
         clip_and_normalize=True,
         clip_and_rescale=False,
@@ -356,7 +381,7 @@ def main(dataset_path):
          file_pattern='archive/next_day_wildfire_spread_test*',
         data_size=64,
         sample_size=32,
-        num_in_channels=12,
+        num_in_channels=19,
         compression_type=None,
         clip_and_normalize=True,
         clip_and_rescale=False,
@@ -367,7 +392,7 @@ def main(dataset_path):
         file_pattern='archive/next_day_wildfire_spread_eval*',
         data_size=64,
         sample_size=32,
-        num_in_channels=12,
+        num_in_channels=19,
         compression_type=None,
         clip_and_normalize=True,
         clip_and_rescale=False,
@@ -388,29 +413,29 @@ def main(dataset_path):
 
     print("The tensorflow datasets were sucessfully converted into numpy arrays")
 
-    if not os.path.exists('data/next-day-wildfire-spread/'):
-        print("Creating data/next-day-wildfire-spread folders")
-        os.makedirs('data/next-day-wildfire-spread/')
+    if not os.path.exists('data32/next-day-wildfire-spread/'):
+        print("Creating data32/next-day-wildfire-spread folders")
+        os.makedirs('data32/next-day-wildfire-spread/')
 
-    with open('data/next-day-wildfire-spread/train.data', 'wb') as handle:
-        pickle.dump(x_train[:, :12, :, :], handle)
-    with open('data/next-day-wildfire-spread/train.labels', 'wb') as handle:
-        pickle.dump(x_train[:, 12, :, :], handle)
+    with open('data32/next-day-wildfire-spread/train.data', 'wb') as handle:
+        pickle.dump(x_train[:, :19, :, :], handle)
+    with open('data32/next-day-wildfire-spread/train.labels', 'wb') as handle:
+        pickle.dump(x_train[:, 19, :, :], handle)
 
-    with open('data/next-day-wildfire-spread/test.data', 'wb') as handle:
-        pickle.dump(x_test[:, :12, :, :], handle)
-    with open('data/next-day-wildfire-spread/test.labels', 'wb') as handle:
-        pickle.dump(x_test[:, 12, :, :], handle)
+    with open('data32/next-day-wildfire-spread/test.data', 'wb') as handle:
+        pickle.dump(x_test[:, :19, :, :], handle)
+    with open('data32/next-day-wildfire-spread/test.labels', 'wb') as handle:
+        pickle.dump(x_test[:, 19, :, :], handle)
 
-    with open('data/next-day-wildfire-spread/validation.data', 'wb') as handle:
-        pickle.dump(x_validation[:, :12, :, :], handle)
-    with open('data/next-day-wildfire-spread/validation.labels', 'wb') as handle:
-        pickle.dump(x_validation[:, 12, :, :], handle)
+    with open('data32/next-day-wildfire-spread/validation.data', 'wb') as handle:
+        pickle.dump(x_validation[:, :19, :, :], handle)
+    with open('data32/next-day-wildfire-spread/validation.labels', 'wb') as handle:
+        pickle.dump(x_validation[:, 19, :, :], handle)
 
-    print("The numpy arrays were successfully pickled in ./data/next-day-wildfire-spread/")
+    print("The numpy arrays were successfully pickled in ./data32/next-day-wildfire-spread/")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('-d', '--dataset', default='/data/next-day-wildfire-spread')
+    parser.add_argument('-d', '--dataset', default='/data32/next-day-wildfire-spread')
     args = parser.parse_args()
     main(args.dataset)

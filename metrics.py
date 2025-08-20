@@ -1,279 +1,245 @@
 import torch
-import numpy as np
-from tqdm import tqdm
-import torch.nn as nn
+import torch.nn.functional as F
 
-# ---------------------- Loss Functions ----------------------
-def dice_loss(gold_mask, pred_mask, smooth=1e-6):
-    # Convert pred_mask to binary
-    pred_mask_binary = (pred_mask > 0.).int()
+# -------------------- numeric stability -------------------- #
+EPS = 1e-7
+LOGIT_CLAMP = 40.0
 
-    mask = gold_mask != -1
+def _safe_labels(x):
+    # Replace NaN/Inf in labels with 0, keep in [0,1]
+    return torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0).clamp(0.0, 1.0)
 
-    gold_mask_masked = gold_mask[mask]
-    pred_mask_masked = pred_mask_binary[mask]
+def _safe_logits(x):
+    # Replace NaN/Inf in logits and clamp to avoid BCE overflow
+    return torch.nan_to_num(x, nan=0.0, posinf=LOGIT_CLAMP, neginf=-LOGIT_CLAMP).clamp(-LOGIT_CLAMP, LOGIT_CLAMP)
 
-    intersection = (gold_mask_masked * pred_mask_masked).sum()
-    union = gold_mask_masked.sum() + pred_mask_masked.sum()
+def _flatten(x):
+    return x.reshape(-1)
 
-    return 1 - ((2.0 * intersection + smooth) / (union + smooth))
+# ============================ LOSSES ============================ #
 
-
-def soft_dice_loss(gold_mask, pred_mask, smooth=1e-6):
+def _make_mask_and_targets(gold_mask, pred_logits, ignore_index: int = -1):
     """
-    Differentiable Dice Loss for training — does not threshold predictions.
+    gold_mask: [B,1,H,W] with {0,1} and possibly -1 to ignore
+    pred_logits: [B,1,H,W] (raw logits)
+    returns: mask (bool), targets (float in {0,1}), logits (sanitized)
     """
-    mask = gold_mask != -1
-    gold = gold_mask[mask].float()
-    pred = torch.sigmoid(pred_mask[mask])  # Use soft probability
+    gold_mask = _safe_labels(gold_mask)
+    logits    = _safe_logits(pred_logits)
 
-    intersection = (gold * pred).sum()
-    union = gold.sum() + pred.sum()
+    # valid elements: finite and not equal to ignore_index
+    # (labels were sanitized to [0,1], but in case dataset used -1, handle separately)
+    if ignore_index is not None:
+        mask = torch.isfinite(gold_mask) & (gold_mask != float(ignore_index))
+    else:
+        mask = torch.isfinite(gold_mask)
 
-    dice = (2.0 * intersection + smooth) / (union + smooth)
-    return 1 - dice
+    targets = gold_mask.float().clamp(0.0, 1.0)
 
-def focal_loss(gold_mask, pred_mask, alpha=0.25, gamma=2.0, reduction='mean'):
-    """
-    Focal Loss with support for -1 ignored labels
-    """
-    # 1. Mask out invalid pixels
-    mask = gold_mask != -1
-    gold_mask = gold_mask[mask].float()
-    pred_mask = pred_mask[mask].float()
+    # shape assertions
+    if logits.shape != targets.shape:
+        raise ValueError(f"[metrics] Shape mismatch: pred_logits {logits.shape} vs labels {targets.shape}")
 
-    # 2. Compute probability
-    prob = torch.sigmoid(pred_mask)
-    prob = torch.clamp(prob, 1e-6, 1.0 - 1e-6)  # Avoid log(0)
+    return mask, targets, logits
 
-    # 3. Focal Loss computation
-    pos_loss = -alpha * (1 - prob) ** gamma * gold_mask * torch.log(prob)
-    neg_loss = -(1 - alpha) * prob ** gamma * (1 - gold_mask) * torch.log(1 - prob)
+def sigmoid_focal_loss_with_logits(logits, targets, mask=None, alpha=0.85, gamma=2.0, reduction="mean"):
+    logits  = _safe_logits(logits)
+    targets = _safe_labels(targets)
 
-    loss = pos_loss + neg_loss
+    bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+    p   = torch.sigmoid(logits)
+    pt  = torch.where(targets > 0.5, p, 1.0 - p)
 
-    if reduction == 'mean':
+    alpha_t = torch.where(
+        targets > 0.5,
+        torch.as_tensor(alpha, device=logits.device, dtype=logits.dtype),
+        torch.as_tensor(1.0 - alpha, device=logits.device, dtype=logits.dtype),
+    )
+    focal = alpha_t * (1.0 - pt).clamp(0.0, 1.0).pow(gamma) * bce
+
+    if mask is not None:
+        focal = focal[mask]
+        if focal.numel() == 0:
+            # return 0 but keep graph
+            return logits.new_zeros((), requires_grad=True)
+
+    if reduction == "mean":
+        return focal.mean()
+    elif reduction == "sum":
+        return focal.sum()
+    return focal
+
+def soft_dice_loss_logits(logits, targets, mask=None, smooth=1e-6):
+    logits  = _safe_logits(logits)
+    targets = _safe_labels(targets)
+
+    probs = torch.sigmoid(logits)
+
+    if mask is not None:
+        probs   = probs[mask]
+        targets = targets[mask]
+
+    if probs.numel() == 0:
+        return logits.new_zeros((), requires_grad=True)
+
+    probs   = _flatten(probs)
+    targets = _flatten(targets)
+
+    intersection = (probs * targets).sum()
+    union        = probs.sum() + targets.sum()
+    dice = 1.0 - ((2.0 * intersection + smooth) / (union + smooth))
+    return dice
+
+def bce_with_logits_masked(logits, targets, mask=None, reduction="mean", pos_weight=None):
+    logits  = _safe_logits(logits)
+    targets = _safe_labels(targets)
+    loss = F.binary_cross_entropy_with_logits(logits, targets, reduction="none", pos_weight=pos_weight)
+    if mask is not None:
+        loss = loss[mask]
+        if loss.numel() == 0:
+            return logits.new_zeros((), requires_grad=True)
+    if reduction == "mean":
         return loss.mean()
-    elif reduction == 'sum':
+    elif reduction == "sum":
         return loss.sum()
     return loss
 
-    
+def focal_dice_loss(gold_mask, pred_logits, alpha=0.85, gamma=2.0, dice_weight=2.0, ignore_index=-1):
+    mask, targets, logits = _make_mask_and_targets(gold_mask, pred_logits, ignore_index=ignore_index)
+    if not mask.any():
+        return logits.new_zeros((), requires_grad=True)
 
-def WBCE(gold_mask, pred_mask, w0=1, w1=100):
-    mask = gold_mask != -1
+    fl = sigmoid_focal_loss_with_logits(logits, targets, mask=mask, alpha=alpha, gamma=gamma, reduction="mean")
+    dl = soft_dice_loss_logits(logits, targets, mask=mask, smooth=1e-6)
+    loss = fl + dice_weight * dl
 
-    gold_mask_masked = gold_mask[mask].float()
-    pred_mask_masked = pred_mask[mask].float()
+    if not torch.isfinite(loss):
+        # one extra sanitize & clamp tighter
+        logits = torch.nan_to_num(logits, nan=0.0, posinf=30.0, neginf=-30.0).clamp(-30.0, 30.0)
+        fl = sigmoid_focal_loss_with_logits(logits, targets, mask=mask, alpha=alpha, gamma=gamma, reduction="mean")
+        dl = soft_dice_loss_logits(logits, targets, mask=mask, smooth=1e-6)
+        loss = fl + dice_weight * dl
+    return loss
 
-    weights = gold_mask_masked * w1 + (1 - gold_mask_masked) * w0
-    criterion = torch.nn.BCEWithLogitsLoss(weight=weights, reduction='mean')
-    return criterion(pred_mask_masked, gold_mask_masked)
-    #return torch.nn.functional.binary_cross_entropy_with_logits(pred_mask_masked, gold_mask_masked, weights, reduction='mean')
+def wbce_dice_loss(gold_mask, pred_logits, dice_weight=1.0, ignore_index=-1, pos_weight=None):
+    mask, targets, logits = _make_mask_and_targets(gold_mask, pred_logits, ignore_index=ignore_index)
+    if not mask.any():
+        return logits.new_zeros((), requires_grad=True)
+    bce = bce_with_logits_masked(logits, targets, mask=mask, reduction="mean", pos_weight=pos_weight)
+    dl  = soft_dice_loss_logits(logits, targets, mask=mask, smooth=1e-6)
+    return bce + dice_weight * dl
 
-# Pred mask is the predicted fire segmentation mask with probability scores that it is fire (class 1)
-# Gold mask is the ground truth fire segmentation mask with values -1 (no data), 0 (no fire), 1 (fire) 
+def focal_only_loss(gold_mask, pred_logits, alpha=0.85, gamma=2.0, ignore_index=-1):
+    mask, targets, logits = _make_mask_and_targets(gold_mask, pred_logits, ignore_index=ignore_index)
+    if not mask.any():
+        return logits.new_zeros((), requires_grad=True)
+    return sigmoid_focal_loss_with_logits(logits, targets, mask=mask, alpha=alpha, gamma=gamma, reduction="mean")
 
-# ---------------------- Loss for wbce ----------------------
-
-def loss(gold_mask, pred_mask, loss_name):
-    if loss_name == "FOCAL":
-        return focal_loss(gold_mask, pred_mask, alpha=0.25, gamma=2.0)
-    elif loss_name == "FOCAL":
-        return focal_loss(gold_mask, pred_mask, alpha=0.25, gamma=2.0)
-    elif loss_name == "WBCE+DICE":
-        return WBCE(gold_mask, pred_mask) + 2 * soft_dice_loss(gold_mask, pred_mask)
-    elif loss_name == "FOCAL+DICE":
-        return focal_loss(gold_mask, pred_mask, alpha=0.25, gamma=2.0) + 2 * soft_dice_loss(gold_mask, pred_mask)
+def loss(gold_mask, pred_logits, loss_name: str):
+    """
+    Dispatcher used by your train/validation loops.
+    Expects raw logits for pred_logits.
+    """
+    name = loss_name.upper().strip()
+    if name in ("FOCAL+DICE", "FOCAL_DICE", "FOCALDICE"):
+        return focal_dice_loss(gold_mask, pred_logits, alpha=0.85, gamma=1.0, dice_weight=2.0, ignore_index=-1)
+    elif name == "FOCAL":
+        return focal_only_loss(gold_mask, pred_logits, alpha=0.85, gamma=2.0, ignore_index=-1)
+    elif name in ("WBCE+DICE", "WBCE_DICE", "WBCEDICE"):
+        return wbce_dice_loss(gold_mask, pred_logits, dice_weight=1.0, ignore_index=-1, pos_weight=None)
     else:
-        raise ValueError(f"Unsupported loss type: {loss_name}")
+        raise ValueError(f"Unknown loss_name: {loss_name}")
 
+# ============================ METRICS ============================ #
 
-# ---------------------- Evaluation Functions ----------------------
-
-
-# ---------------------- Evaluation Functions ----------------------
-def mean_iou(gold_mask, pred_mask):
-    pred_mask_binary = (pred_mask > 0.).int()
-
-    mask = gold_mask != -1
-
-    # Calculate intersection and union of class 1 pixels
-    gold_mask_masked = gold_mask[mask]
-    pred_mask_masked = pred_mask_binary[mask]
-
-    intersection = (gold_mask_masked * pred_mask_masked).sum()
-    union = gold_mask_masked.sum() + pred_mask_masked.sum() - intersection
-
-    # Calculate intersection over union of class 0 pixels
-    gold_mask_masked = 1 - gold_mask_masked
-    pred_mask_masked = 1 - pred_mask_masked
-
-    intersection_0 = (gold_mask_masked * pred_mask_masked).sum()
-    union_0 = gold_mask_masked.sum() + pred_mask_masked.sum() - intersection_0
-
-    return ((intersection / union) + (intersection_0 / union_0)) / 2
-
-def accuracy(gold_mask, pred_mask):
-    pred_mask_binary = (pred_mask > 0.).int()
-
-    mask = gold_mask != -1
-
-    # Calculate accuracy of class 1 pixels
-    gold_mask_masked = gold_mask[mask]
-    pred_mask_masked = pred_mask_binary[mask]
-
-    accuracy_1 = (gold_mask_masked == pred_mask_masked).sum() / len(gold_mask_masked)
-
-    # Calculate accuracy of class 0 pixels
-    gold_mask_masked = 1 - gold_mask_masked
-    pred_mask_masked = 1 - pred_mask_masked
-
-    accuracy_0 = (gold_mask_masked == pred_mask_masked).sum() / len(gold_mask_masked)
-    
-    return (accuracy_1 + accuracy_0) / 2
-
-def distance(gold_mask, pred_mask):
-    mask = gold_mask != -1
-
-    gold_mask_masked = gold_mask[mask].float()
-    pred_mask_masked = torch.sigmoid(pred_mask[mask].float()) # Clamp values between 0 and 1
-
-    return torch.linalg.norm(gold_mask_masked - pred_mask_masked)
-
-def f1_score(gold_mask, pred_mask):
+def _confusion(y_true, y_pred_bin):
     """
-    Computes the F1 score between the predicted mask and the ground truth mask.
-    
-    Args:
-        gold_mask (torch.Tensor): Ground truth mask with values -1 (no data), 0 (no fire), 1 (fire).
-        pred_mask (torch.Tensor): Predicted mask with probability scores.
-    
-    Returns:
-        float: Mean F1 score for both classes (fire and no-fire).
+    Computes TP, FP, FN, TN for binary {0,1} tensors.
+    Shapes: [B,1,H,W] or [1,H,W] or broadcastable. Returns float scalars on y_true.device.
     """
-    # Convert pred_mask to binary
-    pred_mask_binary = (pred_mask > 0.).int()
-    
-    # Mask out -1 values in the ground truth
-    mask = gold_mask != -1
-    gold_mask_masked = gold_mask[mask]
-    pred_mask_masked = pred_mask_binary[mask]
-    
-    # Calculate TP, FP, FN for class 1 (fire)
-    tp_1 = (gold_mask_masked * pred_mask_masked).sum()  # True Positives
-    fp_1 = ((1 - gold_mask_masked) * pred_mask_masked).sum()  # False Positives
-    fn_1 = (gold_mask_masked * (1 - pred_mask_masked)).sum()  # False Negatives
-    
-    # Precision and Recall for class 1
-    precision_1 = tp_1 / (tp_1 + fp_1 + 1e-6)
-    recall_1 = tp_1 / (tp_1 + fn_1 + 1e-6)
-    f1_1 = 2 * (precision_1 * recall_1) / (precision_1 + recall_1 + 1e-6)
-    
-    # Calculate TP, FP, FN for class 0 (no fire)
-    gold_mask_masked_0 = 1 - gold_mask_masked
-    pred_mask_masked_0 = 1 - pred_mask_masked
-    tp_0 = (gold_mask_masked_0 * pred_mask_masked_0).sum()  # True Positives
-    fp_0 = ((1 - gold_mask_masked_0) * pred_mask_masked_0).sum()  # False Positives
-    fn_0 = (gold_mask_masked_0 * (1 - pred_mask_masked_0)).sum()  # False Negatives
-    
-    # Precision and Recall for class 0
-    precision_0 = tp_0 / (tp_0 + fp_0 + 1e-6)
-    recall_0 = tp_0 / (tp_0 + fn_0 + 1e-6)
-    f1_0 = 2 * (precision_0 * recall_0) / (precision_0 + recall_0 + 1e-6)
-    
-    # Return the mean F1 score for both classes
-    return (f1_1 + f1_0) / 2
+    y = _safe_labels(y_true).round()
+    p = _safe_labels(y_pred_bin).round()
 
-from sklearn.metrics import roc_auc_score
+    y = y.to(dtype=torch.bool)
+    p = p.to(dtype=torch.bool)
 
-def auc_score(gold_mask, pred_mask):
-    mask = gold_mask != -1
-    gold_mask_masked = gold_mask[mask].float().cpu().numpy()
-    pred_mask_masked = torch.sigmoid(pred_mask[mask]).detach().cpu().numpy()
-    
-    # Handle cases where all labels are the same (e.g., all 0s or all 1s)
-    if len(np.unique(gold_mask_masked)) == 1:
-        return np.nan
-    return roc_auc_score(gold_mask_masked, pred_mask_masked)
+    tp = torch.sum(p & y).to(dtype=torch.float32)
+    fp = torch.sum(p & ~y).to(dtype=torch.float32)
+    fn = torch.sum(~p & y).to(dtype=torch.float32)
+    tn = torch.sum(~p & ~y).to(dtype=torch.float32)
 
-def precision_recall(gold_mask, pred_mask):
+    return tp, fp, fn, tn
+
+def precision_recall(y_true, y_pred_bin):
+    tp, fp, fn, _ = _confusion(y_true, y_pred_bin)
+    prec = tp / (tp + fp + EPS)
+    rec  = tp / (tp + fn + EPS)
+    return prec, rec
+
+def accuracy(y_true, y_pred_bin):
+    tp, fp, fn, tn = _confusion(y_true, y_pred_bin)
+    acc = (tp + tn) / (tp + tn + fp + fn + EPS)
+    return acc
+
+def mean_iou(y_true, y_pred_bin):
     """
-    Computes precision and recall between the predicted mask and the ground truth mask.
-    
-    Args:
-        gold_mask (torch.Tensor): Ground truth mask with values -1 (no data), 0 (no fire), 1 (fire).
-        pred_mask (torch.Tensor): Predicted mask with probability scores.
-    
-    Returns:
-        float: Mean precision for both classes (fire and no-fire).
-        float: Mean recall for both classes (fire and no-fire).
+    Binary IoU (a.k.a. Jaccard index) with smoothing for empty unions.
     """
-    # Convert pred_mask to binary
-    pred_mask_binary = (pred_mask > 0.).int()
-    
-    # Mask out -1 values in the ground truth
-    mask = gold_mask != -1
-    gold_mask_masked = gold_mask[mask]
-    pred_mask_masked = pred_mask_binary[mask]
-    
-    # Calculate TP, FP, FN for class 1 (fire)
-    tp_1 = (gold_mask_masked * pred_mask_masked).sum()  # True Positives
-    fp_1 = ((1 - gold_mask_masked) * pred_mask_masked).sum()  # False Positives
-    fn_1 = (gold_mask_masked * (1 - pred_mask_masked)).sum()  # False Negatives
-    
-    # Precision and Recall for class 1
-    precision_1 = tp_1 / (tp_1 + fp_1 + 1e-6)
-    recall_1 = tp_1 / (tp_1 + fn_1 + 1e-6)
-    
-    # Calculate TP, FP, FN for class 0 (no fire)
-    gold_mask_masked_0 = 1 - gold_mask_masked
-    pred_mask_masked_0 = 1 - pred_mask_masked
-    tp_0 = (gold_mask_masked_0 * pred_mask_masked_0).sum()  # True Positives
-    fp_0 = ((1 - gold_mask_masked_0) * pred_mask_masked_0).sum()  # False Positives
-    fn_0 = (gold_mask_masked_0 * (1 - pred_mask_masked_0)).sum()  # False Negatives
-    
-    # Precision and Recall for class 0
-    precision_0 = tp_0 / (tp_0 + fp_0 + 1e-6)
-    recall_0 = tp_0 / (tp_0 + fn_0 + 1e-6)
-    
-    # Return the mean precision and recall for both classes
-    mean_precision = (precision_1 + precision_0) / 2
-    mean_recall = (recall_1 + recall_0) / 2
-    return mean_precision, mean_recall
+    y = _safe_labels(y_true).round()
+    p = _safe_labels(y_pred_bin).round()
 
+    inter = torch.sum((y == 1) & (p == 1)).to(dtype=torch.float32)
+    union = torch.sum((y == 1) | (p == 1)).to(dtype=torch.float32)
+    return (inter + EPS) / (union + EPS)
 
-def dice_score(gold_mask, pred_mask, smooth=1e-6):
+def dice_score(y_true, y_pred_bin):
     """
-    Computes the Dice score between the predicted mask and the ground truth mask.
-    
-    Args:
-        gold_mask (torch.Tensor): Ground truth mask with values -1 (no data), 0 (no fire), 1 (fire).
-        pred_mask (torch.Tensor): Predicted mask with probability scores.
-        smooth (float): Smoothing factor to avoid division by zero.
-    
-    Returns:
-        float: Mean Dice score for both classes (fire and no-fire).
+    Sørensen–Dice coefficient (F1 for sets).
     """
-    # Convert pred_mask to binary
-    pred_mask_binary = (pred_mask > 0.).int()
-    
-    # Mask out -1 values in the ground truth
-    mask = gold_mask != -1
-    gold_mask_masked = gold_mask[mask]
-    pred_mask_masked = pred_mask_binary[mask]
-    
-    # Calculate Dice score for class 1 (fire)
-    intersection_1 = (gold_mask_masked * pred_mask_masked).sum()
-    union_1 = gold_mask_masked.sum() + pred_mask_masked.sum()
-    dice_1 = (2.0 * intersection_1 + smooth) / (union_1 + smooth)
-    
-    # Calculate Dice score for class 0 (no fire)
-    gold_mask_masked_0 = 1 - gold_mask_masked
-    pred_mask_masked_0 = 1 - pred_mask_masked
-    intersection_0 = (gold_mask_masked_0 * pred_mask_masked_0).sum()
-    union_0 = gold_mask_masked_0.sum() + pred_mask_masked_0.sum()
-    dice_0 = (2.0 * intersection_0 + smooth) / (union_0 + smooth)
-    
-    # Return the mean Dice score for both classes
-    return (dice_1 + dice_0) / 2
+    y = _safe_labels(y_true).round()
+    p = _safe_labels(y_pred_bin).round()
+
+    inter = torch.sum((y == 1) & (p == 1)).to(dtype=torch.float32)
+    s = torch.sum(y == 1).to(dtype=torch.float32) + torch.sum(p == 1).to(dtype=torch.float32)
+    return (2.0 * inter + EPS) / (s + EPS)
+
+def f1_score(y_true, y_pred_bin):
+    prec, rec = precision_recall(y_true, y_pred_bin)
+    return (2.0 * prec * rec) / (prec + rec + EPS)
+
+def auc_score(y_true, y_pred):
+    """
+    ROC AUC.
+    - If y_pred appears binary (<=2 unique values), return 0.5 (neutral) to avoid misuse.
+    - If y_pred is probabilistic in [0,1], compute AUC via Mann–Whitney U (rank statistic).
+    """
+    y = _safe_labels(y_true).view(-1)
+    p = _safe_labels(y_pred).view(-1)
+
+    # Count positives/negatives
+    pos = (y > 0.5)
+    neg = ~pos
+    n_pos = pos.sum()
+    n_neg = neg.sum()
+
+    if n_pos == 0 or n_neg == 0:
+        return torch.as_tensor(0.5, device=y_true.device, dtype=torch.float32)
+
+    # If predictions look binary, return neutral 0.5
+    uniq = torch.unique(p)
+    if uniq.numel() <= 2:
+        return torch.as_tensor(0.5, device=y_true.device, dtype=torch.float32)
+
+    # Rank-based AUC (equivalent to probability that a random positive > random negative)
+    # Sort predictions and compute ranks
+    sorted_vals, sorted_idx = torch.sort(p)
+    ranks = torch.empty_like(sorted_idx, dtype=torch.float32)
+    ranks[sorted_idx] = torch.arange(1, p.numel() + 1, device=p.device, dtype=torch.float32)
+
+    # Sum of ranks for positive samples
+    rank_pos = ranks[pos]
+    sum_rank_pos = rank_pos.sum()
+
+    auc = (sum_rank_pos - (n_pos * (n_pos + 1) / 2.0)) / (n_pos * n_neg + EPS)
+    # clamp to [0,1]
+    return auc.clamp(0.0, 1.0)

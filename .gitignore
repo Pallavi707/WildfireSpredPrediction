@@ -1,0 +1,15 @@
+# Ignore datasets and checkpoints
+/data/
+/*.pkl
+/*.pt
+/*.h5
+
+# VSCode settings
+.vscode/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
